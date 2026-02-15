@@ -1,5 +1,5 @@
 # ============================================================
-# HEART DISEASE PREDICTION — PUBLICATION CODE ()
+# HEART DISEASE PREDICTION — PUBLICATION CODE (WITH SHAP)
 # Optimized for Reliability, Speed, and Standard Metrics
 # ============================================================
 
@@ -20,6 +20,7 @@ from sklearn.metrics import (accuracy_score, precision_score, recall_score, f1_s
                              roc_auc_score, confusion_matrix, roc_curve, auc)
 import xgboost as xgb
 import optuna
+import shap  # <--- NEW IMPORT
 
 # ============================================================
 # 1. CONFIGURATION
@@ -186,7 +187,7 @@ best_xgb.fit(X_train_sel, y_train_full)
 models['Proposed Method (HHO+Optuna)'] = best_xgb
 
 # ============================================================
-# 7. METRICS & PLOTTING (IMAGES SAVED)
+# 7. METRICS & PLOTTING (WITH SHAP)
 # ============================================================
 print("\n--- 5. Generating Results & Images ---")
 
@@ -238,20 +239,7 @@ plt.savefig('confusion_matrix.png', dpi=300)
 print("Saved: confusion_matrix.png")
 plt.show()
 
-# 3. Save Feature Importance (Replacing SHAP)
-plt.figure(figsize=(8, 5))
-importances = best_xgb.feature_importances_
-indices = np.argsort(importances)[::-1]
-plt.title("Feature Importance (XGBoost)")
-plt.barh(range(len(indices)), importances[indices][::-1], color='steelblue', align='center')
-plt.yticks(range(len(indices)), [final_features[i] for i in indices][::-1])
-plt.xlabel("Relative Importance")
-plt.tight_layout()
-plt.savefig('feature_importance.png', dpi=300)
-print("Saved: feature_importance.png")
-plt.show()
-
-# 4. Save Optuna Optimization History (NEW)
+# 3. Save Optuna Optimization History
 plt.figure(figsize=(10, 6))
 trials = study.trials_dataframe()
 plt.plot(trials['number'], trials['value'], marker='o', linestyle='-', color='tab:orange')
@@ -262,6 +250,34 @@ plt.grid(True, alpha=0.5)
 plt.savefig('optuna_history.png', dpi=300)
 print("Saved: optuna_history.png")
 plt.show()
+
+# ============================================================
+# 8. SHAP EXPLAINABILITY (NEW SECTION)
+# ============================================================
+print("\n--- 6. Generating SHAP Diagrams ---")
+
+# Convert Test Set to DataFrame for better labeling in plots
+X_test_shap_df = pd.DataFrame(X_test_sel, columns=final_features)
+
+# Create Explainer
+explainer = shap.TreeExplainer(best_xgb)
+shap_values = explainer.shap_values(X_test_shap_df)
+
+# A. SHAP Summary Plot (Beeswarm)
+plt.figure()
+plt.title("SHAP Summary Plot")
+shap.summary_plot(shap_values, X_test_shap_df, show=False)
+plt.savefig('shap_summary.png', bbox_inches='tight', dpi=300)
+print("Saved: shap_summary.png")
+plt.close()
+
+# B. SHAP Importance Bar Plot
+plt.figure()
+plt.title("SHAP Feature Importance")
+shap.summary_plot(shap_values, X_test_shap_df, plot_type="bar", show=False)
+plt.savefig('shap_importance.png', bbox_inches='tight', dpi=300)
+print("Saved: shap_importance.png")
+plt.close()
 
 # Print Final Table
 results_df = pd.DataFrame(results_list).sort_values(by="AUC-ROC", ascending=False)
