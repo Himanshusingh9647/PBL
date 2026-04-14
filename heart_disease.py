@@ -1,9 +1,5 @@
 # ==================================================================================
-# IMPROVED PIPELINE — v2
-# Fixes:  1) Confidence-gated fusion  (teacher only helps when it's actually sure)
-#         2) Proper HHO               (energy-based exploration / exploitation)
-#         3) Optuna student tuning    (per-run hyperparameter search)
-#         4) Semantic feature bridge  (map UCI ↔ Kaggle by meaning, not position)
+# IMPROVED PIPELINE — v2 + SHAP EXPLAINABILITY
 # ==================================================================================
 
 import warnings
@@ -13,6 +9,10 @@ import math
 import numpy as np
 import pandas as pd
 import xgboost as xgb
+import shap
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import optuna
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
@@ -27,43 +27,33 @@ from imblearn.over_sampling import SMOTE
 # CONFIG
 # ============================================================
 N_RUNS        = 30
-NP_POPULATION = 30        # ↑ from 20
-MAX_ITER      = 40        # ↑ from 15
-OPTUNA_TRIALS = 25        # student tuning trials per run
+NP_POPULATION = 30
+MAX_ITER      = 40
+OPTUNA_TRIALS = 25
 
 KAGGLE_CSV_PATH = "/content/cardio_train.csv"
 
 # ============================================================
 # SEMANTIC FEATURE BRIDGE
 # ============================================================
-# UCI has 13 features. Kaggle (cardio) has 11 features.
-# Instead of blindly aligning by column position, we hand-map
-# the semantically closest features between the two datasets.
-#
-# UCI columns (index → name):
-#   0  age         1  sex        2  cp (chest pain)   3  trestbps (rest BP)
-#   4  chol        5  fbs        6  restecg            7  thalach (max HR)
-#   8  exang       9  oldpeak   10  slope             11  ca      12  thal
-#
-# Kaggle (cardio) columns (index → name, after dropping id):
-#   0  age   1  gender   2  height   3  weight   4  ap_hi (systolic BP)
-#   5  ap_lo 6  cholesterol  7  gluc   8  smoke   9  alco  10  active
-#
-# Best semantic matches  (UCI_idx → Kaggle_idx):
 UCI_TO_KAGGLE = {
-    0: 0,   # age         ↔ age
-    1: 1,   # sex         ↔ gender
-    3: 4,   # trestbps    ↔ ap_hi (systolic BP)
-    4: 6,   # chol        ↔ cholesterol
-    5: 7,   # fbs         ↔ gluc (both binary metabolic markers)
+    0: 0,   # age      ↔ age
+    1: 1,   # sex      ↔ gender
+    3: 4,   # trestbps ↔ ap_hi
+    4: 6,   # chol     ↔ cholesterol
+    5: 7,   # fbs      ↔ gluc
 }
-# UCI features NOT in the bridge are excluded from the teacher projection
-# (they have no semantic match in cardio_train).
-BRIDGE_UCI_COLS    = sorted(UCI_TO_KAGGLE.keys())        # [0,1,3,4,5]
+BRIDGE_UCI_COLS    = sorted(UCI_TO_KAGGLE.keys())
 BRIDGE_KAGGLE_COLS = [UCI_TO_KAGGLE[k] for k in BRIDGE_UCI_COLS]
+N_BRIDGE           = len(BRIDGE_UCI_COLS)
 
-N_BRIDGE = len(BRIDGE_UCI_COLS)   # 5 shared features
-
+# Human-readable feature names for SHAP plots
+UCI_FEATURE_NAMES = [
+    "age", "sex", "chest pain type", "resting BP",
+    "cholesterol", "fasting blood sugar", "resting ECG",
+    "max heart rate", "exercise angina", "ST depression",
+    "ST slope", "vessels colored", "thal"
+]
 
 # ============================================================
 # DATA LOADERS
@@ -115,7 +105,6 @@ def teacher_guided_fitness(mask, X, y, teacher_probs):
     student_probs = cross_val_predict(
         model, X_sel, y, cv=3, method="predict_proba"
     )[:, 1]
-
     bce      = log_loss(y, student_probs)
     sparsity = mask.sum() / len(mask)
     temp     = 2
@@ -127,11 +116,9 @@ def teacher_guided_fitness(mask, X, y, teacher_probs):
 
 
 # ============================================================
-# FIX 2 — PROPER HHO
-# (energy-based soft/hard besiege + Lévy flight exploration)
+# HHO (Lévy-flight enhanced)
 # ============================================================
 def levy_flight(n, beta=1.5):
-    """Generate a Lévy-distributed step for n dimensions."""
     num   = math.gamma(1+beta) * np.sin(np.pi*beta/2)
     denom = math.gamma((1+beta)/2) * beta * 2**((beta-1)/2)
     sigma = (num/denom) ** (1/beta)
@@ -144,87 +131,64 @@ def run_hho(X, y, teacher_probs, seed):
     np.random.seed(seed)
     n   = X.shape[1]
     pop = np.random.randint(0, 2, (NP_POPULATION, n))
-
-    # Guarantee no all-zero rows
     for i in range(pop.shape[0]):
         if pop[i].sum() == 0:
             pop[i, np.random.randint(0, n)] = 1
 
-    fitness = np.array([teacher_guided_fitness(p, X, y, teacher_probs)
-                        for p in pop])
+    fitness  = np.array([teacher_guided_fitness(p, X, y, teacher_probs) for p in pop])
     best_idx = np.argmin(fitness)
     rabbit   = pop[best_idx].copy()
 
     for t in range(MAX_ITER):
-        # Escaping energy decreases from 2 → 0 over iterations
-        E0 = 2 * np.random.rand() - 1        # initial energy
-        E  = 2 * E0 * (1 - t / MAX_ITER)     # current energy
+        E0 = 2 * np.random.rand() - 1
+        E  = 2 * E0 * (1 - t / MAX_ITER)
 
         for i in range(NP_POPULATION):
             new = pop[i].copy().astype(float)
 
             if abs(E) >= 1:
-                # ── EXPLORATION (far from rabbit) ──────────────────
                 q = np.random.rand()
                 if q >= 0.5:
-                    # Random jump
                     rand_hawk = pop[np.random.randint(0, NP_POPULATION)].astype(float)
                     new = rand_hawk - np.random.rand() * abs(
-                        rand_hawk - 2 * np.random.rand() * pop[i]
-                    )
+                        rand_hawk - 2 * np.random.rand() * pop[i])
                 else:
-                    # Perch near rabbit with Lévy step
                     new = (rabbit.astype(float)
                            - np.mean(pop, axis=0)
-                           - np.random.rand() * (
-                               0.1 + np.random.rand() * 0.9   # [0.1, 1.0] range
-                           ) * levy_flight(n))
-
+                           - np.random.rand() * (0.1 + np.random.rand() * 0.9)
+                           * levy_flight(n))
             else:
-                # ── EXPLOITATION (close to rabbit) ─────────────────
                 r = np.random.rand()
                 if r >= 0.5 and abs(E) >= 0.5:
-                    # Soft besiege
                     delta = rabbit.astype(float) - pop[i].astype(float)
-                    new   = delta - E * abs(
-                        np.random.rand(n) * rabbit - pop[i]
-                    )
+                    new   = delta - E * abs(np.random.rand(n) * rabbit - pop[i])
                 elif r >= 0.5 and abs(E) < 0.5:
-                    # Hard besiege
                     new = rabbit.astype(float) - E * abs(
-                        rabbit.astype(float) - pop[i].astype(float)
-                    )
+                        rabbit.astype(float) - pop[i].astype(float))
                 elif r < 0.5 and abs(E) >= 0.5:
-                    # Soft besiege with rapid dives (Lévy)
                     Y = rabbit.astype(float) - E * abs(
-                        np.random.rand(n) * rabbit - pop[i]
-                    )
+                        np.random.rand(n) * rabbit - pop[i])
                     Z = Y + np.random.rand(n) * levy_flight(n)
                     new = Y if teacher_guided_fitness(
                         (Y > 0.5).astype(int), X, y, teacher_probs
                     ) < teacher_guided_fitness(
-                        (Z > 0.5).astype(int), X, y, teacher_probs
-                    ) else Z
+                        (Z > 0.5).astype(int), X, y, teacher_probs) else Z
                 else:
-                    # Hard besiege with rapid dives
                     Y = rabbit.astype(float) - E * abs(
-                        np.random.rand(n) * rabbit - pop[i]
-                    )
+                        np.random.rand(n) * rabbit - pop[i])
                     Z = Y + np.random.rand(n) * levy_flight(n)
                     new = Y if teacher_guided_fitness(
                         (Y > 0.5).astype(int), X, y, teacher_probs
                     ) < teacher_guided_fitness(
-                        (Z > 0.5).astype(int), X, y, teacher_probs
-                    ) else Z
+                        (Z > 0.5).astype(int), X, y, teacher_probs) else Z
 
-            # Binarise
             new_bin = (new > 0.5).astype(int)
             if new_bin.sum() == 0:
                 new_bin[np.random.randint(0, n)] = 1
 
             f_new = teacher_guided_fitness(new_bin, X, y, teacher_probs)
             if f_new < fitness[i]:
-                pop[i]    = new_bin
+                pop[i]     = new_bin
                 fitness[i] = f_new
                 if f_new < fitness[best_idx]:
                     rabbit   = new_bin.copy()
@@ -234,7 +198,7 @@ def run_hho(X, y, teacher_probs, seed):
 
 
 # ============================================================
-# NGO  (unchanged — reasonable baseline)
+# NGO
 # ============================================================
 def run_ngo(X, y, teacher_probs, seed):
     np.random.seed(seed + 100)
@@ -249,7 +213,7 @@ def run_ngo(X, y, teacher_probs, seed):
 
 
 # ============================================================
-# OOA  (unchanged — reasonable baseline)
+# OOA
 # ============================================================
 def run_ooa(X, y, teacher_probs, seed):
     np.random.seed(seed + 200)
@@ -264,48 +228,35 @@ def run_ooa(X, y, teacher_probs, seed):
 
 
 # ============================================================
-# FIX 1 — CONFIDENCE-GATED FUSION
-# Problem: teacher is ~0.59 cross-domain → blind blending HURTS.
-# Fix:     only blend when teacher is genuinely confident AND
-#          student is genuinely uncertain. Elsewhere trust student.
+# DYNAMIC FUSION
 # ============================================================
 def dynamic_fusion(p_student, p_teacher, gate_threshold=0.25):
-    """
-    gate_threshold: teacher must be at least this far from 0.5
-                    to be allowed to influence the prediction.
-    """
-    teacher_conf   = np.abs(p_teacher - 0.5)          # 0 = uncertain, 0.5 = sure
-    student_uncert = 1 - 2 * np.abs(p_student - 0.5)  # 1 = uncertain, 0 = sure
-
-    # Gate: 1 where teacher is confident, 0 where it is not
+    teacher_conf   = np.abs(p_teacher - 0.5)
+    student_uncert = 1 - 2 * np.abs(p_student - 0.5)
     gate  = (teacher_conf > gate_threshold).astype(float)
-
-    # Alpha: how much teacher weight — capped at 0.35 even when gated
     alpha = gate * student_uncert * 0.35
-
     return (1 - alpha) * p_student + alpha * p_teacher
 
 
 # ============================================================
-# FIX 3 — OPTUNA STUDENT TUNING
+# OPTUNA STUDENT TUNING
 # ============================================================
 def tune_student(X_tr, y_tr, X_val, y_val, seed):
     def objective(trial):
         params = dict(
-            n_estimators    = trial.suggest_int("n_estimators", 100, 400),
-            max_depth       = trial.suggest_int("max_depth", 3, 7),
-            learning_rate   = trial.suggest_float("lr", 0.01, 0.15, log=True),
-            subsample       = trial.suggest_float("subsample", 0.6, 1.0),
-            colsample_bytree= trial.suggest_float("colsample", 0.6, 1.0),
-            min_child_weight= trial.suggest_int("min_child_weight", 1, 10),
-            reg_alpha       = trial.suggest_float("reg_alpha", 0.0, 1.0),
-            reg_lambda      = trial.suggest_float("reg_lambda", 0.5, 3.0),
+            n_estimators     = trial.suggest_int("n_estimators", 100, 400),
+            max_depth        = trial.suggest_int("max_depth", 3, 7),
+            learning_rate    = trial.suggest_float("lr", 0.01, 0.15, log=True),
+            subsample        = trial.suggest_float("subsample", 0.6, 1.0),
+            colsample_bytree = trial.suggest_float("colsample", 0.6, 1.0),
+            min_child_weight = trial.suggest_int("min_child_weight", 1, 10),
+            reg_alpha        = trial.suggest_float("reg_alpha", 0.0, 1.0),
+            reg_lambda       = trial.suggest_float("reg_lambda", 0.5, 3.0),
             verbosity=0, eval_metric="logloss", seed=seed,
         )
         m = xgb.XGBClassifier(**params)
         m.fit(X_tr, y_tr)
-        p = m.predict_proba(X_val)[:, 1]
-        return log_loss(y_val, p)
+        return log_loss(y_val, m.predict_proba(X_val)[:, 1])
 
     study = optuna.create_study(direction="minimize",
                                 sampler=optuna.samplers.TPESampler(seed=seed))
@@ -314,23 +265,150 @@ def tune_student(X_tr, y_tr, X_val, y_val, seed):
 
 
 # ============================================================
-# PREPROCESSING HELPER
+# PREPROCESSING
 # ============================================================
 def preprocess(X_train, X_val, X_test, y_train, seed):
     imp     = SimpleImputer(strategy="median")
     X_train = imp.fit_transform(X_train)
     X_val   = imp.transform(X_val)
     X_test  = imp.transform(X_test)
-
     sm               = SMOTE(random_state=seed)
     X_train, y_train = sm.fit_resample(X_train, y_train)
-
     sc      = RobustScaler()
     X_train = sc.fit_transform(X_train)
     X_val   = sc.transform(X_val)
     X_test  = sc.transform(X_test)
-
     return X_train, X_val, X_test, y_train, imp, sc
+
+
+# ============================================================
+# SHAP ANALYSIS
+# Called once after the 30-run loop using the last run's models.
+# Saves 3 plots per algorithm to /content/:
+#   1. shap_summary_{name}.png   — bar chart + beeswarm side by side
+#   2. shap_waterfall_{name}.png — single patient breakdown
+# Also prints a cross-algorithm consensus table to console.
+# ============================================================
+def run_shap_analysis(shap_store):
+    print("\n" + "="*62)
+    print("SHAP EXPLAINABILITY")
+    print("="*62)
+
+    for name, store in shap_store.items():
+        sv         = store["shap_values"]   # (n_test, n_selected_features)
+        X_te       = store["X_te"]
+        y_test     = store["y_test"]
+        feat_names = store["feat_names"]
+        fusion_p   = store["fusion_probs"]
+        explainer  = store["explainer"]
+        n_sel      = len(feat_names)
+
+        print(f"\n── {name}  ({n_sel} features selected) ──")
+        print(f"   Features: {feat_names}")
+
+        # ── 1. Summary plot: bar + beeswarm ──────────────────────
+        mean_abs = np.abs(sv).mean(axis=0)
+        order    = np.argsort(mean_abs)[::-1]
+
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, max(4, n_sel * 0.6 + 1.5)))
+        fig.suptitle(f"SHAP — {name} student  |  {n_sel} features selected",
+                     fontsize=13, fontweight="bold", y=1.01)
+
+        # Left: mean |SHAP| bar chart
+        ax1.barh(
+            [feat_names[i] for i in order],
+            [mean_abs[i]   for i in order],
+            color="#1D9E75", edgecolor="none", height=0.6
+        )
+        ax1.set_xlabel("Mean |SHAP value|", fontsize=10)
+        ax1.set_title("Global feature importance", fontsize=11)
+        ax1.invert_yaxis()
+        ax1.spines[["top","right"]].set_visible(False)
+        ax1.tick_params(labelsize=9)
+
+        # Right: beeswarm — each dot = one patient
+        # Color = normalised raw feature value (red=high, green=low)
+        for rank, fi in enumerate(order):
+            vals    = sv[:, fi]
+            fv_norm = (X_te[:, fi] - X_te[:, fi].min()) / (np.ptp(X_te[:, fi]) + 1e-9)
+            ax2.scatter(
+                vals,
+                np.full_like(vals, rank) + np.random.uniform(-0.2, 0.2, len(vals)),
+                c=fv_norm, cmap="RdYlGn_r", alpha=0.65, s=18, linewidths=0
+            )
+        ax2.set_yticks(range(len(order)))
+        ax2.set_yticklabels([feat_names[i] for i in order], fontsize=9)
+        ax2.axvline(0, color="#888", lw=0.8, linestyle="--")
+        ax2.set_xlabel("SHAP value  (+ = pushes toward disease)", fontsize=10)
+        ax2.set_title("Per-patient impact\n(red=high value, green=low value)", fontsize=11)
+        ax2.spines[["top","right"]].set_visible(False)
+
+        plt.tight_layout()
+        path_summary = f"/content/shap_summary_{name}.png"
+        fig.savefig(path_summary, dpi=130, bbox_inches="tight")
+        plt.close(fig)
+        print(f"   Saved: {path_summary}")
+
+        # ── 2. Waterfall — most confident correct prediction ─────
+        preds       = (fusion_p > 0.5).astype(int)
+        correct_idx = np.where(preds == y_test)[0]
+        if len(correct_idx) > 0:
+            chosen = correct_idx[np.argmax(np.abs(fusion_p[correct_idx] - 0.5))]
+        else:
+            chosen = 0
+
+        true_label   = "disease" if y_test[chosen] == 1 else "healthy"
+        fusion_score = fusion_p[chosen]
+
+        base_val = explainer.expected_value
+        if isinstance(base_val, (list, np.ndarray)):
+            base_val = float(base_val[1]) if len(base_val) > 1 else float(base_val[0])
+
+        exp = shap.Explanation(
+            values        = sv[chosen],
+            base_values   = base_val,
+            data          = X_te[chosen],
+            feature_names = feat_names,
+        )
+
+        fig2, _ = plt.subplots(figsize=(9, max(4, n_sel * 0.6 + 2)))
+        shap.waterfall_plot(exp, max_display=n_sel, show=False)
+        fig2.suptitle(
+            f"{name} — patient #{chosen}  |  true: {true_label}  "
+            f"|  fusion score: {fusion_score:.3f}",
+            fontsize=11, fontweight="bold"
+        )
+        plt.tight_layout()
+        path_wf = f"/content/shap_waterfall_{name}.png"
+        fig2.savefig(path_wf, dpi=130, bbox_inches="tight")
+        plt.close(fig2)
+        print(f"   Saved: {path_wf}")
+
+        # ── 3. Console importance ranking ────────────────────────
+        print(f"\n   Feature ranking by mean |SHAP|:")
+        for rank, fi in enumerate(order, 1):
+            direction = "↑ risk" if sv[:, fi].mean() > 0 else "↓ risk"
+            print(f"   {rank}. {feat_names[fi]:<22}  "
+                  f"|SHAP|={mean_abs[fi]:.4f}   avg direction: {direction}")
+
+    # ── Cross-algorithm consensus table ──────────────────────────
+    print("\n" + "="*62)
+    print("CROSS-ALGORITHM FEATURE SELECTION CONSENSUS")
+    print("="*62)
+    all_names = sorted({f for s in shap_store.values() for f in s["feat_names"]})
+    rows = []
+    for fname in all_names:
+        row = {"feature": fname}
+        for alg, store in shap_store.items():
+            if fname in store["feat_names"]:
+                fi  = store["feat_names"].index(fname)
+                imp = float(np.abs(store["shap_values"][:, fi]).mean())
+                row[alg] = f"YES  ({imp:.3f})"
+            else:
+                row[alg] = "—"
+        rows.append(row)
+    print(pd.DataFrame(rows).set_index("feature").to_string())
+    print("\nAll SHAP plots saved to /content/")
 
 
 # ============================================================
@@ -342,7 +420,7 @@ if __name__ == "__main__":
     X_kaggle, y_kaggle = load_kaggle_data()
     X_uci,    y_uci    = load_uci_data()
 
-    # ── Preprocess Kaggle (teacher) ───────────────────────
+    # Preprocess Kaggle (teacher)
     imp_kag  = SimpleImputer(strategy="median")
     X_kaggle = imp_kag.fit_transform(X_kaggle)
     sm_kag             = SMOTE(random_state=42)
@@ -350,7 +428,7 @@ if __name__ == "__main__":
     sc_kag   = RobustScaler()
     X_kaggle = sc_kag.fit_transform(X_kaggle)
 
-    # ── Train teacher ─────────────────────────────────────
+    # Train teacher
     print("\nTraining teacher on Kaggle data...")
     teacher_base = xgb.XGBClassifier(
         n_estimators=300, max_depth=6, learning_rate=0.05,
@@ -363,6 +441,9 @@ if __name__ == "__main__":
 
     algorithms = {"HHO": run_hho, "NGO": run_ngo, "OOA": run_ooa}
     results    = {k: [] for k in algorithms}
+
+    # Populated on the final run for SHAP analysis
+    shap_store = {}
 
     for run in range(N_RUNS):
         print(f"RUN {run + 1}/{N_RUNS}")
@@ -381,24 +462,17 @@ if __name__ == "__main__":
             X_train, X_val, X_test, y_train, run
         )
 
-        # ── FIX 4: Semantic bridge for teacher projection ──
-        # Extract only the semantically matched UCI columns,
-        # reorder them to match the Kaggle column order the
-        # teacher was trained on, pad remaining Kaggle columns to 0.
+        # Semantic bridge: project UCI → Kaggle feature space
         def project_uci_to_kaggle(X_uci_scaled):
-            n_samples  = X_uci_scaled.shape[0]
-            X_proj     = np.zeros((n_samples, X_kaggle.shape[1]))
+            X_proj = np.zeros((X_uci_scaled.shape[0], X_kaggle.shape[1]))
             for uci_col, kag_col in zip(BRIDGE_UCI_COLS, BRIDGE_KAGGLE_COLS):
                 X_proj[:, kag_col] = X_uci_scaled[:, uci_col]
             return X_proj
 
-        X_train_proj = project_uci_to_kaggle(X_train)
-        X_test_proj  = project_uci_to_kaggle(X_test)
+        p_teach_train = teacher.predict_proba(project_uci_to_kaggle(X_train))[:, 1]
+        p_teach_test  = teacher.predict_proba(project_uci_to_kaggle(X_test))[:,  1]
 
-        p_teach_train = teacher.predict_proba(X_train_proj)[:, 1]
-        p_teach_test  = teacher.predict_proba(X_test_proj)[:,  1]
-
-        # ── Feature selection + student ───────────────────
+        # Feature selection + student
         for name, algo in algorithms.items():
 
             mask = algo(X_train, y_train, p_teach_train, run)
@@ -410,7 +484,6 @@ if __name__ == "__main__":
             X_te = X_test[:,  idx]
             X_v  = X_val[:,   idx]
 
-            # Tune student with Optuna
             best_params = tune_student(X_tr, y_train, X_v, y_val, seed=run)
 
             student = xgb.XGBClassifier(
@@ -426,11 +499,9 @@ if __name__ == "__main__":
             )
             student.fit(X_tr, y_train)
 
-            p_stud_test  = np.clip(student.predict_proba(X_te)[:, 1], 1e-6, 1-1e-6)
+            p_stud_test   = np.clip(student.predict_proba(X_te)[:, 1], 1e-6, 1-1e-6)
             p_teach_test_ = np.clip(p_teach_test, 1e-6, 1-1e-6)
-
-            # Confidence-gated fusion
-            fusion = dynamic_fusion(p_stud_test, p_teach_test_)
+            fusion        = dynamic_fusion(p_stud_test, p_teach_test_)
 
             acc = accuracy_score(y_test, (fusion > 0.5).astype(int))
             results[name].append(acc)
@@ -438,11 +509,21 @@ if __name__ == "__main__":
             if run == N_RUNS - 1:
                 stud_acc  = accuracy_score(y_test, (p_stud_test   > 0.5))
                 teach_acc = accuracy_score(y_test, (p_teach_test_  > 0.5))
-                n_feats   = idx.shape[0]
-                print(f"  {name:3s} | features={n_feats:2d} | "
+                print(f"  {name:3s} | features={idx.shape[0]:2d} | "
                       f"Student={stud_acc:.4f}  "
                       f"Teacher(bridge)={teach_acc:.4f}  "
                       f"Fusion={acc:.4f}")
+
+                # Save everything needed for SHAP
+                explainer = shap.TreeExplainer(student)
+                shap_store[name] = {
+                    "explainer"   : explainer,
+                    "shap_values" : explainer.shap_values(X_te),
+                    "X_te"        : X_te,
+                    "y_test"      : y_test,
+                    "feat_names"  : [UCI_FEATURE_NAMES[i] for i in idx],
+                    "fusion_probs": fusion,
+                }
 
     print("\n" + "="*62)
     print("FINAL RESULTS  (accuracy over 30 runs)")
@@ -455,3 +536,6 @@ if __name__ == "__main__":
         delta = df_res[col].mean() - 0.7279
         sign  = "+" if delta >= 0 else ""
         print(f"  {col}: {df_res[col].mean():.4f}  ({sign}{delta:.4f})")
+
+    # Run SHAP analysis on the final run's models
+    run_shap_analysis(shap_store)
